@@ -1,0 +1,71 @@
+# ── Dependencies ──────────────────────────────────────────
+node_modules/
+.pnp/
+.pnp.js
+.yarn/
+
+# ── Environment & secrets ────────────────────────────────
+.env
+.env.*
+!.env.example
+!.env.docker.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.env.export
+/secrets/
+
+# ── Build output ──────────────────────────────────────────
+dist/
+build/
+.vite/
+.turbo/
+*.tsbuildinfo
+
+# ── Generated Prisma client ──────────────────────────────
+backend/src/generated/
+
+# ── Databases & dumps ────────────────────────────────────
+*.sqlite
+*.sqlite3
+*.db
+*.sql.gz
+*.dump
+pgdata/
+
+# ── Logs ──────────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+backend-dev.log
+
+# ── Test & coverage artifacts ────────────────────────────
+coverage/
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+playwright/.cache/
+
+# ── Exports / local artifacts ────────────────────────────
+/exports/
+tmp/
+.tmp/
+
+# ── Docker ────────────────────────────────────────────────
+docker-data/
+
+# ── Editor / OS ───────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ── Deploy targets ────────────────────────────────────────
+.vercel
