@@ -1,0 +1,421 @@
+// Vaultory database schema.
+//
+// Security note: every user-supplied sensitive value (passwords, tokens, keys,
+// note bodies, custom fields) lives inside the `ciphertext` columns below and is
+// encrypted in the browser with AES-256-GCM before it ever reaches this server.
+// The only plaintext columns are non-secret metadata needed for querying
+// (title, category, tags, folder, favourite flag, timestamps).
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum SecretCategory {
+  LOGIN
+  API_KEY
+  DATABASE
+  SERVER_SSH
+  CLOUD
+  ENV_VARS
+  WIFI_VPN
+  PRIVATE_KEY
+  RECOVERY_CODE
+  LICENSE_KEY
+  PAYMENT
+  EMAIL_SERVICE
+  IDENTITY
+  MOBILE
+  CRYPTO
+  PERSONAL
+  SECURE_NOTE
+  CUSTOM
+}
+
+enum TokenType {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+  MFA_LOGIN
+  EXTENSION_LINK
+}
+
+enum ActivityType {
+  SIGNUP
+  LOGIN
+  LOGOUT
+  PASSWORD_CHANGED
+  PASSWORD_RESET_REQUESTED
+  PASSWORD_RESET_COMPLETED
+  EMAIL_VERIFIED
+  SESSION_REVOKED
+  SESSIONS_REVOKED_OTHERS
+  SETTINGS_UPDATED
+  SECRET_CREATED
+  SECRET_UPDATED
+  SECRET_DELETED
+  SECRET_RESTORED
+  SECRETS_IMPORTED
+  SECRETS_EXPORTED
+  FOLDER_CREATED
+  FOLDER_RENAMED
+  FOLDER_DELETED
+  ATTACHMENT_UPLOADED
+  ATTACHMENT_DELETED
+  SECRET_TRASHED
+  SECRET_PURGED
+  VAULT_KEY_ROTATED
+  TOTP_ENABLED
+  TOTP_DISABLED
+  SHARE_SENT
+  SHARE_ACCEPTED
+  SHARE_REVOKED
+  EMERGENCY_GRANTED
+  EMERGENCY_REQUESTED
+  EMERGENCY_APPROVED
+  EMERGENCY_CANCELLED
+  EMERGENCY_USED
+}
+
+model User {
+  id    String  @id @default(uuid())
+  email String  @unique
+  name  String?
+
+  /// scrypt hash of the *client-derived* authentication verifier.
+  /// The browser never sends the account password itself.
+  authHash String
+
+  /// Client-side KDF parameters used to derive the root key from the password.
+  /// Stored so the parameters can be upgraded later without breaking old vaults.
+  kdfAlgorithm   String @default("argon2id")
+  kdfMemoryKiB   Int    @default(19456)
+  kdfIterations  Int    @default(2)
+  kdfParallelism Int    @default(1)
+
+  /// Vault data key, wrapped with a key derived from the account password.
+  /// Format: "v1.<base64 nonce>.<base64 ciphertext>" - opaque to the server.
+  wrappedVaultKey String
+  vaultKeyVersion Int    @default(1)
+
+  /// Same vault key, ECDH-wrapped to the server's escrow key at signup.
+  /// Lets an email-verified password reset recover the vault without a
+  /// recovery phrase. NULL for accounts created before escrow existed -
+  /// those still rotate the key (and lose old ciphertext) on reset.
+  serverWrappedVaultKey String?
+
+  /// TOTP authenticator secret for account 2FA, AES-256-GCM wrapped with a key
+  /// derived from VAULT_WRAP_SECRET - never stored in raw form. Present during
+  /// pending setup and while `totpEnabled` is true.
+  totpSecret  String?
+  totpEnabled Boolean @default(false)
+
+  /// ECDH P-256 public key (raw uncompressed point, base64) used so other
+  /// users can encrypt a shared secret *to* this account. NULL until the
+  /// user has unlocked their vault once - the keypair is generated
+  /// client-side and the private half never leaves the browser unwrapped.
+  sharePublicKey String?
+
+  /// The matching private key (PKCS8), AES-256-GCM wrapped under the vault
+  /// key - opaque ciphertext to the server.
+  sharePrivateKeyWrapped Json?
+
+  passkeys Passkey[]
+
+  emailVerifiedAt   DateTime?
+  autoLockMinutes   Int       @default(15)
+  theme             String    @default("system")
+  passwordChangedAt DateTime  @default(now())
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  sessions       Session[]
+  tokens         VerificationToken[]
+  folders        Folder[]
+  secrets        Secret[]
+  activity       ActivityEvent[]
+  sentShares     Share[]         @relation("SentShares")
+  receivedShares Share[]         @relation("ReceivedShares")
+  accessGrants   EmergencyGrant[] @relation("EmergencyGrantor")
+  accessRequests EmergencyGrant[] @relation("EmergencyGrantee")
+}
+
+enum ShareStatus {
+  PENDING
+  ACCEPTED
+}
+
+/// A single secret shared between two Vaultory users, end-to-end encrypted
+/// with ECDH(P-256): the sender's ephemeral private key + the recipient's
+/// published share key. The server stores only the ciphertext.
+model Share {
+  id          String   @id @default(uuid())
+  senderId    String
+  recipientId String
+
+  /// Displayed to the recipient before accepting - same trust level as
+  /// secret titles, which are already plaintext.
+  title    String
+  category SecretCategory
+
+  /// Sender's share-scoped public point + the AES-GCM wrapped payload.
+  senderPublicKey String
+  nonce           String
+  ciphertext      String
+
+  status    ShareStatus @default(PENDING)
+  createdAt DateTime    @default(now())
+  expiresAt DateTime?
+
+  sender    User @relation("SentShares", fields: [senderId], references: [id], onDelete: Cascade)
+  recipient User @relation("ReceivedShares", fields: [recipientId], references: [id], onDelete: Cascade)
+
+  @@index([recipientId, status])
+  @@index([senderId])
+}
+
+/// A WebAuthn PRF credential used to unwrap the vault key after the session
+/// is already authenticated. Not a login factor: the stored blob is the
+/// vault key AES-GCM wrapped under the authenticator's PRF output - the
+/// server never sees the PRF secret or the raw vault key.
+model Passkey {
+  id           String  @id @default(uuid())
+  userId       String
+  /// base64url credential id from the browser.
+  credentialId String  @unique
+  name         String?
+  /// Fixed 32-byte PRF eval salt (base64) chosen at enrollment.
+  prfSalt      String
+  /// {nonce, ciphertext} - the vault key wrapped under the PRF-derived key.
+  wrappedVaultKey Json
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+enum EmergencyStatus {
+  /// Grantor named a trusted contact; grantee has not requested access.
+  PENDING
+  /// Grantee requested access; waiting period is running.
+  WAITING
+  /// Wait elapsed and grantor handed over the vault key (or auto-approved).
+  APPROVED
+  /// Grantor revoked/cancelled - terminal.
+  CANCELLED
+}
+
+/// Emergency access: a trusted contact can request read access to the
+/// grantor's vault. After `waitDays` the grantor's *client* re-wraps the
+/// vault key to the grantee's share key and stores it here - the server
+/// only ever holds ciphertext. The grantor can cancel while WAITING.
+model EmergencyGrant {
+  id        String          @id @default(uuid())
+  grantorId String
+  granteeId String
+  status    EmergencyStatus @default(PENDING)
+  waitDays  Int             @default(7)
+
+  requestedAt DateTime?
+  /// After this timestamp the grantor's client may hand over the key.
+  waitUntil   DateTime?
+  approvedAt  DateTime?
+
+  /// Vault key re-wrapped under ECDH(grantor eph, grantee share key) - only
+  /// set by the grantor's browser when handing over. Opaque to the server.
+  handoverSenderPublicKey String?
+  handoverNonce           String?
+  handoverCiphertext      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  grantor User @relation("EmergencyGrantor", fields: [grantorId], references: [id], onDelete: Cascade)
+  grantee User @relation("EmergencyGrantee", fields: [granteeId], references: [id], onDelete: Cascade)
+
+  @@index([granteeId, status])
+  @@index([grantorId])
+}
+
+model Session {
+  id         String    @id @default(uuid())
+  userId     String
+  /// HMAC-SHA256 of the opaque session token (the raw token only exists in the cookie).
+  /// The per-session CSRF token is derived from the same raw token via HMAC and
+  /// therefore needs no column of its own.
+  tokenHash  String    @unique
+  userAgent  String?
+  ipLabel    String?
+  /// ISO alpha-2 country from the edge geo header - coarse on purpose, the
+  /// same privacy posture as the masked ipLabel.
+  country    String?
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime  @default(now())
+  expiresAt  DateTime
+  revokedAt  DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model VerificationToken {
+  id        String    @id @default(uuid())
+  userId    String
+  type      TokenType
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@index([expiresAt])
+}
+
+model Folder {
+  id        String   @id @default(uuid())
+  userId    String
+  name      String
+  color     String?
+  /// Nested folders: null = top level. Deleting a folder lifts its children
+  /// to the deleted folder's parent (SetNull), never cascades to them.
+  parentId  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parent   Folder?  @relation("FolderChildren", fields: [parentId], references: [id], onDelete: SetNull)
+  children Folder[] @relation("FolderChildren")
+  secrets  Secret[]
+
+  @@unique([userId, name])
+  @@index([userId])
+  @@index([parentId])
+}
+
+model Secret {
+  id       String  @id @default(uuid())
+  userId   String
+  folderId String?
+
+  // ---- queryable, non-sensitive metadata ----
+  title      String
+  category   SecretCategory
+  tags       String[]       @default([])
+  isFavorite Boolean        @default(false)
+
+  // ---- encrypted payload (all sensitive fields) ----
+  /// Encrypted-data format version.
+  encVersion Int    @default(1)
+  /// Which vault key generation encrypted this row.
+  keyVersion Int    @default(1)
+  /// base64 96-bit AES-GCM nonce, unique per write.
+  nonce      String
+  /// base64 AES-256-GCM ciphertext with appended authentication tag.
+  ciphertext String
+
+  version   Int      @default(1)
+  /// Soft-delete timestamp: trashed rows are hidden everywhere and purged
+  /// after ~30 days. NULL means live.
+  deletedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  folder   Folder?         @relation(fields: [folderId], references: [id], onDelete: SetNull)
+  versions SecretVersion[]
+  attachments Attachment[]
+
+  @@index([userId, updatedAt(sort: Desc)])
+  @@index([userId, category])
+  @@index([userId, folderId])
+  @@index([userId, isFavorite])
+  @@index([userId, deletedAt])
+}
+
+/// Encrypted file attached to a secret: .env files, PEM/PPK keys, keystores,
+/// VPN configs, certificates. `fileName`/`size`/`mimeType` stay plaintext for
+/// display; the bytes are AES-256-GCM ciphertext produced in the browser.
+model Attachment {
+  id       String @id @default(uuid())
+  userId   String /// denormalised owner id so fetches are authorised directly
+  secretId String
+
+  fileName String
+  mimeType String?
+  /// Original plaintext byte size - ciphertext size is derivable from the blob.
+  size Int
+
+  encVersion Int    @default(1)
+  /// Which vault key generation encrypted this file.
+  keyVersion Int    @default(1)
+  /// base64 96-bit AES-GCM nonce, unique per upload.
+  nonce      String
+  /// base64 AES-256-GCM ciphertext of the raw file bytes (max ~5 MiB plain).
+  ciphertext String
+
+  createdAt DateTime @default(now())
+
+  secret Secret @relation(fields: [secretId], references: [id], onDelete: Cascade)
+
+  @@index([secretId])
+  @@index([userId])
+}
+
+model SecretVersion {
+  id       String @id @default(uuid())
+  secretId String
+  /// Denormalised owner id so version rows can be authorised directly.
+  userId   String
+  version  Int
+
+  title      String
+  category   SecretCategory
+  encVersion Int            @default(1)
+  keyVersion Int            @default(1)
+  nonce      String
+  ciphertext String
+  createdAt  DateTime       @default(now())
+
+  secret Secret @relation(fields: [secretId], references: [id], onDelete: Cascade)
+
+  @@unique([secretId, version])
+  @@index([userId])
+  @@index([secretId, createdAt(sort: Desc)])
+}
+
+model ActivityEvent {
+  id     String       @id @default(uuid())
+  userId String
+  type   ActivityType
+
+  targetType String?
+  targetId   String?
+  /// Non-sensitive label only (secret title / folder name). Never a secret value.
+  targetLabel String?
+  ipLabel     String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+/// Durable rate-limit counters: serverless instances do not share memory, so
+/// auth-sensitive limits are tracked in the database instead.
+model RateLimitCounter {
+  key       String   @id
+  count     Int      @default(0)
+  windowEnd DateTime
+
+  @@index([windowEnd])
+}
