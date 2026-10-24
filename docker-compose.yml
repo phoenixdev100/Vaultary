@@ -1,0 +1,66 @@
+# Vaultory self-hosted stack: Postgres + migrations + API + web (nginx).
+#
+#   cp .env.docker.example .env   # fill the secrets
+#   docker compose up -d --build
+#
+# App listens on http://localhost:8080
+
+name: vaultory
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vaultory}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-vaultory}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # One-shot job: applies prisma migrations, then exits.
+  migrate:
+    build:
+      context: ./backend
+      target: migrate
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-vaultory}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-vaultory}
+      DIRECT_URL: postgresql://${POSTGRES_USER:-vaultory}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-vaultory}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: "4000"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TRUST_PROXY: "true"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-vaultory}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-vaultory}
+      DIRECT_URL: postgresql://${POSTGRES_USER:-vaultory}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-vaultory}
+      APP_URL: ${APP_URL:-http://localhost:8080}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
