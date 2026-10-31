@@ -7,7 +7,7 @@ import { getIpLabel, getUserAgent } from '../utils/request.js';
 interface RecordActivityParams {
   userId: string;
   type: ActivityType;
-  targetType?: 'secret' | 'folder' | 'account' | 'session' | 'attachment';
+  targetType?: 'secret' | 'folder' | 'account' | 'session' | 'attachment' | 'workspace';
   targetId?: string;
   /** Non-sensitive label (secret title / folder name). Never a secret value. */
   targetLabel?: string | null;

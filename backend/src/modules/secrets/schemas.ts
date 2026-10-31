@@ -35,6 +35,9 @@ export const updateSecretSchema = z
     title: titleSchema.optional(),
     category: categorySchema.optional(),
     folderId: idSchema.nullish(),
+    /// Moving a secret to another workspace: must be owned by the same user.
+    /// Folders never cross workspaces, so the secret is detached on move.
+    workspaceId: idSchema.optional(),
     tags: tagsSchema.optional(),
     isFavorite: z.boolean().optional(),
     encVersion: z.literal(1).optional(),
