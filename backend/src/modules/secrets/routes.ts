@@ -7,6 +7,7 @@ import {
 import { prisma } from '../../db/prisma.js';
 import type { Prisma, Secret } from '../../generated/prisma/client.js';
 import { csrfGuard, getAuth, requireAuth, requireVerifiedEmail } from '../../middleware/auth.js';
+import { getWorkspaceId, workspaceScope } from '../../middleware/workspace.js';
 import { recordActivity } from '../../services/activity.js';
 import { toAttachmentDto, toSecretDto, toSecretVersionDto } from '../../utils/dto.js';
 import { ApiError } from '../../utils/http.js';
@@ -21,36 +22,49 @@ import {
 
 export const secretsRouter = Router();
 
-secretsRouter.use(requireAuth, requireVerifiedEmail, csrfGuard);
+secretsRouter.use(requireAuth, requireVerifiedEmail, csrfGuard, workspaceScope);
 
 /** Ownership is always re-checked against the session user, never the payload. */
-async function findOwnedSecret(id: string, userId: string): Promise<Secret> {
-  const secret = await prisma.secret.findFirst({ where: { id, userId, deletedAt: null } });
+async function findOwnedSecret(id: string, userId: string, workspaceId: string): Promise<Secret> {
+  const secret = await prisma.secret.findFirst({ where: { id, userId, workspaceId, deletedAt: null } });
   if (!secret) throw ApiError.notFound('That item is not in your vault.');
   return secret;
 }
 
 /** Only matches rows that are actually in the trash. */
-async function findTrashedSecret(id: string, userId: string): Promise<Secret> {
-  const secret = await prisma.secret.findFirst({ where: { id, userId, deletedAt: { not: null } } });
+async function findTrashedSecret(id: string, userId: string, workspaceId: string): Promise<Secret> {
+  const secret = await prisma.secret.findFirst({
+    where: { id, userId, workspaceId, deletedAt: { not: null } },
+  });
   if (!secret) throw ApiError.notFound('That item is not in the trash.');
   return secret;
 }
 
 /** Permanently deletes rows past the retention window. Runs lazily on reads. */
-async function purgeExpiredTrash(userId: string): Promise<void> {
+async function purgeExpiredTrash(userId: string, workspaceId: string): Promise<void> {
   const cutoff = new Date(Date.now() - TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000);
-  await prisma.secret.deleteMany({ where: { userId, deletedAt: { lt: cutoff } } });
+  await prisma.secret.deleteMany({ where: { userId, workspaceId, deletedAt: { lt: cutoff } } });
 }
 
-async function assertFolderOwned(folderId: string | null | undefined, userId: string): Promise<void> {
+async function assertFolderOwned(
+  folderId: string | null | undefined,
+  userId: string,
+  workspaceId: string,
+): Promise<void> {
   if (!folderId) return;
-  const folder = await prisma.folder.findFirst({ where: { id: folderId, userId }, select: { id: true } });
-  if (!folder) throw ApiError.badRequest('That folder does not exist in your vault.');
+  const folder = await prisma.folder.findFirst({
+    where: { id: folderId, userId, workspaceId },
+    select: { id: true },
+  });
+  if (!folder) throw ApiError.badRequest('That folder does not exist in this workspace.');
 }
 
-function buildWhere(userId: string, filters: ReturnType<typeof listSecretsQuerySchema.parse>) {
-  const where: Prisma.SecretWhereInput = { userId, deletedAt: null };
+function buildWhere(
+  userId: string,
+  workspaceId: string,
+  filters: ReturnType<typeof listSecretsQuerySchema.parse>,
+) {
+  const where: Prisma.SecretWhereInput = { userId, workspaceId, deletedAt: null };
 
   if (filters.category) where.category = filters.category;
   if (filters.favorite !== undefined) where.isFavorite = filters.favorite;
@@ -79,7 +93,7 @@ secretsRouter.get('/', async (req, res) => {
   const filters = parseQuery(listSecretsQuerySchema, req);
 
   const items = await prisma.secret.findMany({
-    where: buildWhere(user.id, filters),
+    where: buildWhere(user.id, getWorkspaceId(req), filters),
     orderBy: buildOrderBy(filters.sort),
     take: filters.limit + 1,
     ...(filters.cursor ? { cursor: { id: filters.cursor }, skip: 1 } : {}),
@@ -97,12 +111,14 @@ secretsRouter.get('/', async (req, res) => {
 
 secretsRouter.post('/', async (req, res) => {
   const { user } = getAuth(req);
+  const workspaceId = getWorkspaceId(req);
   const body = parseBody(createSecretSchema, req);
-  await assertFolderOwned(body.folderId, user.id);
+  await assertFolderOwned(body.folderId, user.id, workspaceId);
 
   const secret = await prisma.secret.create({
     data: {
       userId: user.id,
+      workspaceId,
       title: body.title,
       category: body.category,
       folderId: body.folderId ?? null,
@@ -129,14 +145,16 @@ secretsRouter.post('/', async (req, res) => {
 
 secretsRouter.post('/bulk', async (req, res) => {
   const { user } = getAuth(req);
+  const workspaceId = getWorkspaceId(req);
   const body = parseBody(bulkCreateSecretsSchema, req);
 
   const folderIds = [...new Set(body.items.map((item) => item.folderId).filter(Boolean))] as string[];
-  for (const folderId of folderIds) await assertFolderOwned(folderId, user.id);
+  for (const folderId of folderIds) await assertFolderOwned(folderId, user.id, workspaceId);
 
   const created = await prisma.secret.createManyAndReturn({
     data: body.items.map((item) => ({
       userId: user.id,
+      workspaceId,
       title: item.title,
       category: item.category,
       folderId: item.folderId ?? null,
@@ -163,10 +181,11 @@ secretsRouter.post('/bulk', async (req, res) => {
 /** Trash listing. Registered before /:id so "trash" is never parsed as an id. */
 secretsRouter.get('/trash', async (req, res) => {
   const { user } = getAuth(req);
-  await purgeExpiredTrash(user.id);
+  const workspaceId = getWorkspaceId(req);
+  await purgeExpiredTrash(user.id, workspaceId);
 
   const items = await prisma.secret.findMany({
-    where: { userId: user.id, deletedAt: { not: null } },
+    where: { userId: user.id, workspaceId, deletedAt: { not: null } },
     orderBy: { deletedAt: 'desc' },
   });
 
@@ -177,7 +196,7 @@ secretsRouter.get('/trash', async (req, res) => {
 secretsRouter.delete('/trash', async (req, res) => {
   const { user } = getAuth(req);
   const result = await prisma.secret.deleteMany({
-    where: { userId: user.id, deletedAt: { not: null } },
+    where: { userId: user.id, workspaceId: getWorkspaceId(req), deletedAt: { not: null } },
   });
 
   if (result.count > 0) {
@@ -195,24 +214,43 @@ secretsRouter.delete('/trash', async (req, res) => {
 
 secretsRouter.get('/:id', async (req, res) => {
   const { user } = getAuth(req);
-  const secret = await findOwnedSecret(parseIdParam(req), user.id);
+  const secret = await findOwnedSecret(parseIdParam(req), user.id, getWorkspaceId(req));
   res.json({ secret: toSecretDto(secret) });
 });
 
 secretsRouter.patch('/:id', async (req, res) => {
   const { user } = getAuth(req);
   const id = parseIdParam(req);
+  const workspaceId = getWorkspaceId(req);
   const body = parseBody(updateSecretSchema, req);
-  const existing = await findOwnedSecret(id, user.id);
+  const existing = await findOwnedSecret(id, user.id, workspaceId);
 
-  if (body.folderId !== undefined) await assertFolderOwned(body.folderId, user.id);
+  // Moving to another workspace: the target must be owned by the same user.
+  // Folders are workspace-local, so the move detaches the secret (an explicit
+  // folderId in the body is validated against the *destination* workspace).
+  const moveTarget = body.workspaceId !== undefined && body.workspaceId !== existing.workspaceId
+    ? body.workspaceId
+    : undefined;
+  if (moveTarget) {
+    const target = await prisma.workspace.findFirst({
+      where: { id: moveTarget, userId: user.id },
+      select: { id: true },
+    });
+    if (!target) throw ApiError.notFound('That organisation does not exist.');
+  }
+  const effectiveWorkspaceId = moveTarget ?? existing.workspaceId;
+
+  if (body.folderId !== undefined) await assertFolderOwned(body.folderId, user.id, effectiveWorkspaceId);
 
   const payloadChanged = body.ciphertext !== undefined && body.nonce !== undefined;
 
   const data: Prisma.SecretUpdateInput = {};
   if (body.title !== undefined) data.title = body.title;
   if (body.category !== undefined) data.category = body.category;
-  if (body.folderId !== undefined) {
+  if (moveTarget) data.workspace = { connect: { id: moveTarget } };
+  if (moveTarget && body.folderId === undefined) {
+    data.folder = { disconnect: true };
+  } else if (body.folderId !== undefined) {
     data.folder = body.folderId ? { connect: { id: body.folderId } } : { disconnect: true };
   }
   if (body.tags !== undefined) data.tags = body.tags;
@@ -228,6 +266,10 @@ secretsRouter.patch('/:id', async (req, res) => {
 
   const [secret] = await prisma.$transaction([
     prisma.secret.update({ where: { id: existing.id }, data }),
+    // Attachments carry a denormalised workspaceId - keep it in sync on moves.
+    ...(moveTarget
+      ? [prisma.attachment.updateMany({ where: { secretId: existing.id }, data: { workspaceId: moveTarget } })]
+      : []),
     // Snapshot the *previous* encrypted payload before overwriting it.
     ...(payloadChanged
       ? [
@@ -266,7 +308,7 @@ secretsRouter.patch('/:id', async (req, res) => {
 secretsRouter.delete('/:id', async (req, res) => {
   const { user } = getAuth(req);
   const id = parseIdParam(req);
-  const secret = await findOwnedSecret(id, user.id);
+  const secret = await findOwnedSecret(id, user.id, getWorkspaceId(req));
 
   await prisma.secret.update({ where: { id: secret.id }, data: { deletedAt: new Date() } });
   await recordActivity({
@@ -283,7 +325,7 @@ secretsRouter.delete('/:id', async (req, res) => {
 
 secretsRouter.post('/:id/restore', async (req, res) => {
   const { user } = getAuth(req);
-  const secret = await findTrashedSecret(parseIdParam(req), user.id);
+  const secret = await findTrashedSecret(parseIdParam(req), user.id, getWorkspaceId(req));
 
   const restored = await prisma.secret.update({
     where: { id: secret.id },
@@ -305,7 +347,7 @@ secretsRouter.post('/:id/restore', async (req, res) => {
 /** Hard delete from the trash - cascades versions and attachments. */
 secretsRouter.delete('/:id/permanent', async (req, res) => {
   const { user } = getAuth(req);
-  const secret = await findTrashedSecret(parseIdParam(req), user.id);
+  const secret = await findTrashedSecret(parseIdParam(req), user.id, getWorkspaceId(req));
 
   await prisma.secret.delete({ where: { id: secret.id } });
   await recordActivity({
@@ -322,7 +364,7 @@ secretsRouter.delete('/:id/permanent', async (req, res) => {
 
 secretsRouter.get('/:id/versions', async (req, res) => {
   const { user } = getAuth(req);
-  const secret = await findOwnedSecret(parseIdParam(req), user.id);
+  const secret = await findOwnedSecret(parseIdParam(req), user.id, getWorkspaceId(req));
 
   const versions = await prisma.secretVersion.findMany({
     where: { secretId: secret.id, userId: user.id },
@@ -338,7 +380,7 @@ secretsRouter.get('/:id/versions', async (req, res) => {
 
 secretsRouter.post('/:id/versions/:versionId/restore', async (req, res) => {
   const { user } = getAuth(req);
-  const secret = await findOwnedSecret(parseIdParam(req), user.id);
+  const secret = await findOwnedSecret(parseIdParam(req), user.id, getWorkspaceId(req));
   const versionId = parseIdParam(req, 'versionId');
 
   const version = await prisma.secretVersion.findFirst({
@@ -397,7 +439,7 @@ secretsRouter.post('/:id/versions/:versionId/restore', async (req, res) => {
 
 secretsRouter.get('/:id/attachments', async (req, res) => {
   const { user } = getAuth(req);
-  const secret = await findOwnedSecret(parseIdParam(req), user.id);
+  const secret = await findOwnedSecret(parseIdParam(req), user.id, getWorkspaceId(req));
 
   const items = await prisma.attachment.findMany({
     where: { secretId: secret.id, userId: user.id },
@@ -409,7 +451,7 @@ secretsRouter.get('/:id/attachments', async (req, res) => {
 
 secretsRouter.post('/:id/attachments', async (req, res) => {
   const { user } = getAuth(req);
-  const secret = await findOwnedSecret(parseIdParam(req), user.id);
+  const secret = await findOwnedSecret(parseIdParam(req), user.id, getWorkspaceId(req));
   const body = parseBody(createAttachmentSchema, req);
 
   const count = await prisma.attachment.count({ where: { secretId: secret.id } });
@@ -420,6 +462,9 @@ secretsRouter.post('/:id/attachments', async (req, res) => {
   const attachment = await prisma.attachment.create({
     data: {
       userId: user.id,
+      // Attachments live wherever their secret lives - the denormalised scope
+      // stays in sync with the parent, including workspace moves.
+      workspaceId: secret.workspaceId,
       secretId: secret.id,
       fileName: body.fileName,
       mimeType: body.mimeType ?? null,
@@ -446,7 +491,7 @@ secretsRouter.post('/:id/attachments', async (req, res) => {
 /** Download returns the ciphertext blob; decryption happens in the browser. */
 secretsRouter.get('/:id/attachments/:attachmentId', async (req, res) => {
   const { user } = getAuth(req);
-  const secret = await findOwnedSecret(parseIdParam(req), user.id);
+  const secret = await findOwnedSecret(parseIdParam(req), user.id, getWorkspaceId(req));
   const attachmentId = parseIdParam(req, 'attachmentId');
 
   const attachment = await prisma.attachment.findFirst({
@@ -459,7 +504,7 @@ secretsRouter.get('/:id/attachments/:attachmentId', async (req, res) => {
 
 secretsRouter.delete('/:id/attachments/:attachmentId', async (req, res) => {
   const { user } = getAuth(req);
-  const secret = await findOwnedSecret(parseIdParam(req), user.id);
+  const secret = await findOwnedSecret(parseIdParam(req), user.id, getWorkspaceId(req));
   const attachmentId = parseIdParam(req, 'attachmentId');
 
   const attachment = await prisma.attachment.findFirst({
@@ -483,14 +528,14 @@ secretsRouter.delete('/:id/attachments/:attachmentId', async (req, res) => {
 /** Dedicated favourites listing used by the Favourites page. */
 export const favoritesRouter = Router();
 
-favoritesRouter.use(requireAuth, requireVerifiedEmail, csrfGuard);
+favoritesRouter.use(requireAuth, requireVerifiedEmail, csrfGuard, workspaceScope);
 
 favoritesRouter.get('/', async (req, res) => {
   const { user } = getAuth(req);
   const filters = parseQuery(listSecretsQuerySchema, req);
 
   const items = await prisma.secret.findMany({
-    where: { ...buildWhere(user.id, filters), isFavorite: true },
+    where: { ...buildWhere(user.id, getWorkspaceId(req), filters), isFavorite: true },
     orderBy: buildOrderBy(filters.sort),
     take: filters.limit,
   });

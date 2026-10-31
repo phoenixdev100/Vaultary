@@ -10,6 +10,12 @@ declare global {
       };
       /** True when auth came via Authorization: Bearer (extension clients). */
       bearerAuth?: boolean;
+      /**
+       * Populated by `workspaceScope`: the workspace this request is scoped to.
+       * Resolved from the X-Workspace-Id header, falling back to the account's
+       * default (Personal) workspace for clients that do not send it.
+       */
+      workspaceId?: string;
       /** Stable id attached to every request and echoed in 500 responses. */
       requestId?: string;
     }

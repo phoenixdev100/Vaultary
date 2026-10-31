@@ -152,26 +152,28 @@ authRouter.post(
         wrappedVaultKey: body.wrappedVaultKey,
         serverWrappedVaultKey: body.serverWrappedVaultKey ?? null,
         autoLockMinutes: env.AUTO_LOCK_MINUTES,
-        // Starter folders so the vault is immediately organisable.
-        folders: { create: [{ name: 'Personal' }, { name: 'Development' }] },
       },
+    });
+
+    // Every account starts with a Personal workspace and starter folders inside
+    // it - the same shape the backfill migration creates for older accounts.
+    const workspace = await prisma.workspace.create({
+      data: { userId: user.id, name: 'Personal', isDefault: true },
+    });
+    await prisma.folder.createMany({
+      data: [
+        { userId: user.id, workspaceId: workspace.id, name: 'Personal' },
+        { userId: user.id, workspaceId: workspace.id, name: 'Development' },
+      ],
     });
 
     const issued = await createSession(user.id, req);
     setSessionCookie(res, issued);
     await recordActivity({ userId: user.id, type: 'SIGNUP', targetType: 'account', req });
 
-    let emailVerification: { required: boolean; delivered: boolean; previewUrl?: string } | undefined;
-    if (env.REQUIRE_EMAIL_VERIFICATION) {
-      // Best-effort: a broken mail transport must never strand a fresh account.
-      emailVerification = await sendVerificationEmail(user.id, user.email).catch((error) => {
-        logger.warn({ err: error instanceof Error ? error.message : error }, 'verification email failed');
-        return { required: true, delivered: false };
-      });
-    }
-
-    // Awaited because serverless freezes the instance right after the response;
-    // still best-effort - a mail hiccup never breaks signup.
+    // No verification OTP at signup: the account lands on the verify wall and
+    // the user explicitly requests a code via /auth/resend-verification. Only
+    // the welcome email goes out automatically.
     const { message: welcome } = welcomeEmail(user.email, user.name);
     await mailer.send(welcome).catch((error) => {
       logger.warn({ err: error instanceof Error ? error.message : error }, 'welcome email failed');
@@ -181,7 +183,6 @@ authRouter.post(
       user: toUserDto(user),
       csrfToken: issued.csrfToken,
       sessionToken: issued.token,
-      ...(emailVerification ? { emailVerification } : {}),
     });
   },
 );

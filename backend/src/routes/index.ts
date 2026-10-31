@@ -10,6 +10,7 @@ import { metaRouter } from '../modules/meta/routes.js';
 import { favoritesRouter, secretsRouter } from '../modules/secrets/routes.js';
 import { accountRouter, settingsRouter } from '../modules/settings/routes.js';
 import { sharesRouter } from '../modules/shares/routes.js';
+import { workspacesRouter } from '../modules/workspaces/routes.js';
 
 export const apiRouter = Router();
 
@@ -33,6 +34,7 @@ apiRouter.get('/health', async (_req, res) => {
 apiRouter.use('/auth', authBurstLimiter, authRouter);
 apiRouter.use('/secrets', secretsRouter);
 apiRouter.use('/favorites', favoritesRouter);
+apiRouter.use('/workspaces', workspacesRouter);
 apiRouter.use('/folders', foldersRouter);
 apiRouter.use('/activity', activityRouter);
 apiRouter.use('/settings', settingsRouter);

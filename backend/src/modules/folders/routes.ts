@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { MAX_FOLDER_DEPTH, MAX_FOLDERS_PER_USER } from '../../config/constants.js';
 import { prisma } from '../../db/prisma.js';
 import { csrfGuard, getAuth, requireAuth, requireVerifiedEmail } from '../../middleware/auth.js';
+import { getWorkspaceId, workspaceScope } from '../../middleware/workspace.js';
 import { recordActivity } from '../../services/activity.js';
 import { toFolderDto } from '../../utils/dto.js';
 import { ApiError } from '../../utils/http.js';
@@ -39,9 +40,12 @@ const folderCountInclude = {
  * Resolves a target parent folder for create/move: it must belong to the user.
  * Throws notFound for foreign or missing ids so folder existence is not leaked.
  */
-async function requireOwnedFolder(userId: string, parentId: string): Promise<void> {
-  const parent = await prisma.folder.findFirst({ where: { id: parentId, userId }, select: { id: true } });
-  if (!parent) throw ApiError.notFound('That parent folder does not exist in your vault.');
+async function requireOwnedFolder(userId: string, workspaceId: string, parentId: string): Promise<void> {
+  const parent = await prisma.folder.findFirst({
+    where: { id: parentId, userId, workspaceId },
+    select: { id: true },
+  });
+  if (!parent) throw ApiError.notFound('That parent folder does not exist in this workspace.');
 }
 
 /**
@@ -49,7 +53,7 @@ async function requireOwnedFolder(userId: string, parentId: string): Promise<voi
  * a move that would point a folder at itself or one of its own descendants
  * loops forever, so walking up with a visited-set rejects it.
  */
-async function ancestorDepth(userId: string, startParentId: string | null, forbiddenId?: string) {
+async function ancestorDepth(userId: string, workspaceId: string, startParentId: string | null, forbiddenId?: string) {
   const visited = new Set<string>();
   let current = startParentId;
   let depth = 0;
@@ -58,7 +62,7 @@ async function ancestorDepth(userId: string, startParentId: string | null, forbi
     visited.add(current);
     depth += 1;
     const row = await prisma.folder.findFirst({
-      where: { id: current, userId },
+      where: { id: current, userId, workspaceId },
       select: { parentId: true },
     });
     if (!row) return -1;
@@ -71,12 +75,12 @@ async function ancestorDepth(userId: string, startParentId: string | null, forbi
  * Deepest descendant chain below a folder - moving a folder under a new parent
  * must respect MAX_FOLDER_DEPTH for the whole moved subtree, not just the node.
  */
-async function deepestChildDepth(userId: string, folderId: string): Promise<number> {
+async function deepestChildDepth(userId: string, workspaceId: string, folderId: string): Promise<number> {
   let frontier = [folderId];
   let depth = 0;
   while (frontier.length > 0) {
     const children = await prisma.folder.findMany({
-      where: { userId, parentId: { in: frontier } },
+      where: { userId, workspaceId, parentId: { in: frontier } },
       select: { id: true },
     });
     if (children.length === 0) return depth;
@@ -88,22 +92,26 @@ async function deepestChildDepth(userId: string, folderId: string): Promise<numb
 
 export const foldersRouter = Router();
 
-foldersRouter.use(requireAuth, requireVerifiedEmail, csrfGuard);
+foldersRouter.use(requireAuth, requireVerifiedEmail, csrfGuard, workspaceScope);
 
 foldersRouter.get('/', async (req, res) => {
   const { user } = getAuth(req);
+  const workspaceId = getWorkspaceId(req);
   const folders = await prisma.folder.findMany({
-    where: { userId: user.id },
+    where: { userId: user.id, workspaceId },
     orderBy: { name: 'asc' },
     include: folderCountInclude,
   });
 
-  const unfiled = await prisma.secret.count({ where: { userId: user.id, folderId: null, deletedAt: null } });
+  const unfiled = await prisma.secret.count({
+    where: { userId: user.id, workspaceId, folderId: null, deletedAt: null },
+  });
   res.json({ items: folders.map(toFolderDto), unfiledCount: unfiled });
 });
 
 foldersRouter.post('/', async (req, res) => {
   const { user } = getAuth(req);
+  const workspaceId = getWorkspaceId(req);
   const body = parseBody(createFolderSchema, req);
 
   const count = await prisma.folder.count({ where: { userId: user.id } });
@@ -112,21 +120,27 @@ foldersRouter.post('/', async (req, res) => {
   }
 
   if (body.parentId) {
-    await requireOwnedFolder(user.id, body.parentId);
-    const depth = await ancestorDepth(user.id, body.parentId);
+    await requireOwnedFolder(user.id, workspaceId, body.parentId);
+    const depth = await ancestorDepth(user.id, workspaceId, body.parentId);
     if (depth < 0 || depth + 1 > MAX_FOLDER_DEPTH) {
       throw ApiError.badRequest(`Folders can only be nested ${MAX_FOLDER_DEPTH} levels deep.`);
     }
   }
 
   const duplicate = await prisma.folder.findFirst({
-    where: { userId: user.id, name: body.name },
+    where: { userId: user.id, workspaceId, name: body.name },
     select: { id: true },
   });
   if (duplicate) throw ApiError.conflict('A folder with that name already exists.');
 
   const folder = await prisma.folder.create({
-    data: { userId: user.id, name: body.name, color: body.color ?? null, parentId: body.parentId ?? null },
+    data: {
+      userId: user.id,
+      workspaceId,
+      name: body.name,
+      color: body.color ?? null,
+      parentId: body.parentId ?? null,
+    },
     include: folderCountInclude,
   });
 
@@ -144,15 +158,16 @@ foldersRouter.post('/', async (req, res) => {
 
 foldersRouter.patch('/:id', async (req, res) => {
   const { user } = getAuth(req);
+  const workspaceId = getWorkspaceId(req);
   const id = parseIdParam(req);
   const body = parseBody(updateFolderSchema, req);
 
-  const existing = await prisma.folder.findFirst({ where: { id, userId: user.id } });
-  if (!existing) throw ApiError.notFound('That folder does not exist in your vault.');
+  const existing = await prisma.folder.findFirst({ where: { id, userId: user.id, workspaceId } });
+  if (!existing) throw ApiError.notFound('That folder does not exist in this workspace.');
 
   if (body.name && body.name !== existing.name) {
     const duplicate = await prisma.folder.findFirst({
-      where: { userId: user.id, name: body.name, id: { not: id } },
+      where: { userId: user.id, workspaceId, name: body.name, id: { not: id } },
       select: { id: true },
     });
     if (duplicate) throw ApiError.conflict('A folder with that name already exists.');
@@ -163,12 +178,12 @@ foldersRouter.patch('/:id', async (req, res) => {
   // depth limit at its new level.
   if (body.parentId !== undefined && body.parentId !== existing.parentId) {
     if (body.parentId !== null) {
-      await requireOwnedFolder(user.id, body.parentId);
-      const parentDepth = await ancestorDepth(user.id, body.parentId, id);
+      await requireOwnedFolder(user.id, workspaceId, body.parentId);
+      const parentDepth = await ancestorDepth(user.id, workspaceId, body.parentId, id);
       if (parentDepth < 0) {
         throw ApiError.badRequest('A folder cannot be moved inside itself or its own subfolder.');
       }
-      const childDepth = await deepestChildDepth(user.id, existing.id);
+      const childDepth = await deepestChildDepth(user.id, workspaceId, existing.id);
       if (parentDepth + 1 + childDepth > MAX_FOLDER_DEPTH) {
         throw ApiError.badRequest(`That move would exceed the ${MAX_FOLDER_DEPTH}-level nesting limit.`);
       }
@@ -200,14 +215,15 @@ foldersRouter.patch('/:id', async (req, res) => {
 
 foldersRouter.delete('/:id', async (req, res) => {
   const { user } = getAuth(req);
+  const workspaceId = getWorkspaceId(req);
   const id = parseIdParam(req);
   const { strategy } = parseQuery(deleteFolderQuerySchema, req);
 
   const folder = await prisma.folder.findFirst({
-    where: { id, userId: user.id },
+    where: { id, userId: user.id, workspaceId },
     include: { _count: { select: { secrets: true, children: true } } },
   });
-  if (!folder) throw ApiError.notFound('That folder does not exist in your vault.');
+  if (!folder) throw ApiError.notFound('That folder does not exist in this workspace.');
 
   const deleteSecrets = strategy === 'delete-secrets';
   // Children are lifted to this folder's parent so the tree shape survives -
@@ -220,10 +236,12 @@ foldersRouter.delete('/:id', async (req, res) => {
   const deletedSecrets = await prisma.$transaction(async (tx) => {
     let count = 0;
     if (deleteSecrets) {
-      count = (await tx.secret.deleteMany({ where: { userId: user.id, folderId: folder.id } })).count;
+      count = (
+        await tx.secret.deleteMany({ where: { userId: user.id, workspaceId, folderId: folder.id } })
+      ).count;
     }
     await tx.folder.updateMany({
-      where: { userId: user.id, parentId: folder.id },
+      where: { userId: user.id, workspaceId, parentId: folder.id },
       data: { parentId: folder.parentId },
     });
     await tx.folder.delete({ where: { id: folder.id } });

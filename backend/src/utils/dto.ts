@@ -6,6 +6,7 @@ import type {
   SecretVersion,
   Session,
   User,
+  Workspace,
 } from '../generated/prisma/client.js';
 
 /** Everything the browser needs to unlock the vault - never the vault key itself. */
@@ -33,6 +34,17 @@ export function toUserDto(user: User) {
   };
 }
 
+export function toWorkspaceDto(workspace: Workspace) {
+  return {
+    id: workspace.id,
+    name: workspace.name,
+    color: workspace.color,
+    isDefault: workspace.isDefault,
+    createdAt: workspace.createdAt.toISOString(),
+    updatedAt: workspace.updatedAt.toISOString(),
+  };
+}
+
 export function toSecretDto(secret: Secret) {
   return {
     id: secret.id,
@@ -41,6 +53,7 @@ export function toSecretDto(secret: Secret) {
     tags: secret.tags,
     isFavorite: secret.isFavorite,
     folderId: secret.folderId,
+    workspaceId: secret.workspaceId,
     encVersion: secret.encVersion,
     keyVersion: secret.keyVersion,
     nonce: secret.nonce,

@@ -79,6 +79,9 @@ enum ActivityType {
   EMERGENCY_APPROVED
   EMERGENCY_CANCELLED
   EMERGENCY_USED
+  WORKSPACE_CREATED
+  WORKSPACE_RENAMED
+  WORKSPACE_DELETED
 }
 
 model User {
@@ -135,6 +138,7 @@ model User {
 
   sessions       Session[]
   tokens         VerificationToken[]
+  workspaces     Workspace[]
   folders        Folder[]
   secrets        Secret[]
   activity       ActivityEvent[]
@@ -280,9 +284,36 @@ model VerificationToken {
   @@index([expiresAt])
 }
 
+/// A personal workspace ("organization") that fully isolates folders and
+/// secrets: queries always filter by workspace so data from one workspace can
+/// never appear inside another. All workspaces share the account vault key -
+/// the boundary is organisational, not cryptographic. Every account gets a
+/// "Personal" workspace at signup (isDefault) which also receives rows from
+/// clients that do not send an X-Workspace-Id header.
+model Workspace {
+  id        String   @id @default(uuid())
+  userId    String
+  name      String
+  color     String?
+  /// Signup/backfill workspace. Cannot be deleted; used as the fallback scope
+  /// when a request carries no workspace header (older extension builds).
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  folders  Folder[]
+  secrets  Secret[]
+
+  @@unique([userId, name])
+  @@index([userId])
+}
+
 model Folder {
   id        String   @id @default(uuid())
   userId    String
+  /// Folders always live inside exactly one workspace - they never span orgs.
+  workspaceId String
   name      String
   color     String?
   /// Nested folders: null = top level. Deleting a folder lifts its children
@@ -291,20 +322,23 @@ model Folder {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  parent   Folder?  @relation("FolderChildren", fields: [parentId], references: [id], onDelete: SetNull)
-  children Folder[] @relation("FolderChildren")
-  secrets  Secret[]
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  parent    Folder?   @relation("FolderChildren", fields: [parentId], references: [id], onDelete: SetNull)
+  children  Folder[]  @relation("FolderChildren")
+  secrets   Secret[]
 
-  @@unique([userId, name])
+  @@unique([workspaceId, name])
   @@index([userId])
+  @@index([workspaceId])
   @@index([parentId])
 }
 
 model Secret {
-  id       String  @id @default(uuid())
-  userId   String
-  folderId String?
+  id          String  @id @default(uuid())
+  userId      String
+  workspaceId String
+  folderId    String?
 
   // ---- queryable, non-sensitive metadata ----
   title      String
@@ -329,25 +363,29 @@ model Secret {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  user     User            @relation(fields: [userId], references: [id], onDelete: Cascade)
-  folder   Folder?         @relation(fields: [folderId], references: [id], onDelete: SetNull)
-  versions SecretVersion[]
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  folder    Folder?         @relation(fields: [folderId], references: [id], onDelete: SetNull)
+  versions  SecretVersion[]
   attachments Attachment[]
 
-  @@index([userId, updatedAt(sort: Desc)])
-  @@index([userId, category])
-  @@index([userId, folderId])
-  @@index([userId, isFavorite])
-  @@index([userId, deletedAt])
+  @@index([workspaceId, updatedAt(sort: Desc)])
+  @@index([workspaceId, category])
+  @@index([workspaceId, folderId])
+  @@index([workspaceId, isFavorite])
+  @@index([workspaceId, deletedAt])
+  @@index([userId])
 }
 
 /// Encrypted file attached to a secret: .env files, PEM/PPK keys, keystores,
 /// VPN configs, certificates. `fileName`/`size`/`mimeType` stay plaintext for
 /// display; the bytes are AES-256-GCM ciphertext produced in the browser.
 model Attachment {
-  id       String @id @default(uuid())
-  userId   String /// denormalised owner id so fetches are authorised directly
-  secretId String
+  id          String @id @default(uuid())
+  userId      String /// denormalised owner id so fetches are authorised directly
+  /// Denormalised scope so attachment queries filter like secret queries.
+  workspaceId String
+  secretId    String
 
   fileName String
   mimeType String?
@@ -368,6 +406,7 @@ model Attachment {
 
   @@index([secretId])
   @@index([userId])
+  @@index([workspaceId])
 }
 
 model SecretVersion {
